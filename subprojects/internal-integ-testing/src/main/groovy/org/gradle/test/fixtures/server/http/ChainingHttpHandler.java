@@ -23,7 +23,6 @@ import org.gradle.internal.UncheckedException;
 import org.gradle.internal.exceptions.DefaultMultiCauseException;
 
 import javax.annotation.Nullable;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -34,7 +33,7 @@ import java.util.concurrent.locks.Lock;
 class ChainingHttpHandler implements HttpHandler {
     private final AtomicInteger counter;
     private final List<TrackingHttpHandler> handlers = new CopyOnWriteArrayList<TrackingHttpHandler>();
-    private final List<RequestOutcome> outcomes = new CopyOnWriteArrayList<RequestOutcome>();
+    private final List<RequestOutcome> outcomes = new ArrayList<RequestOutcome>();
     private final Lock lock;
     private WaitPrecondition last;
     private boolean completed;
@@ -65,9 +64,7 @@ class ChainingHttpHandler implements HttpHandler {
         try {
             List<Throwable> failures = new ArrayList<Throwable>();
             for (RequestOutcome outcome : outcomes) {
-                if (outcome.failure != null) {
-                    failures.add(outcome.failure);
-                }
+                outcome.collectFailures(failures);
             }
             if (!completed) {
                 for (TrackingHttpHandler handler : handlers) {
@@ -88,37 +85,68 @@ class ChainingHttpHandler implements HttpHandler {
     }
 
     @Override
-    public void handle(HttpExchange httpExchange) throws IOException {
+    public void handle(HttpExchange httpExchange) {
         try {
             int id = counter.incrementAndGet();
-            RequestOutcome outcome = new RequestOutcome();
-            outcomes.add(outcome);
-            String requestMethod = httpExchange.getRequestMethod();
-            String requestPath = httpExchange.getRequestURI().getPath();
 
-            System.out.println(String.format("[%d] handling %s %s", id, requestMethod, requestPath));
+            RequestOutcome outcome = requestStarted(httpExchange);
+            System.out.println(String.format("[%d] handling %s", id, outcome.getDisplayName()));
 
-            ResourceHandler resourceHandler = selectHandler(id, httpExchange, outcome);
-            if (resourceHandler != null) {
-                System.out.println(String.format("[%d] sending response for %s %s", id, requestMethod, requestPath));
-                try {
+            try {
+                ResourceHandler resourceHandler = selectHandler(id, httpExchange, outcome);
+                if (resourceHandler != null) {
+                    System.out.println(String.format("[%d] sending response for %s", id, outcome.getDisplayName()));
                     resourceHandler.writeTo(id, httpExchange);
-                } catch (Throwable t) {
-                    System.out.println(String.format("[%d] handling %s %s failed with exception", id, requestMethod, requestPath));
-                    outcome.failure = new AssertionError(String.format("Failed to handle %s %s", httpExchange.getRequestMethod(), httpExchange.getRequestURI().getPath()), t);
-                }
-            } else {
-                System.out.println(String.format("[%d] sending error response for unexpected request", id));
-                if (requestMethod.equals("HEAD")) {
-                    httpExchange.sendResponseHeaders(500, -1);
                 } else {
-                    byte[] message = String.format("Failed %s request to %s", requestMethod, requestPath).getBytes(Charsets.UTF_8);
-                    httpExchange.sendResponseHeaders(500, message.length);
-                    httpExchange.getResponseBody().write(message);
+                    System.out.println(String.format("[%d] sending error response for unexpected request", id));
+                    if (outcome.method.equals("HEAD")) {
+                        httpExchange.sendResponseHeaders(500, -1);
+                    } else {
+                        byte[] message = String.format("Failed request %s", outcome.getDisplayName()).getBytes(Charsets.UTF_8);
+                        httpExchange.sendResponseHeaders(500, message.length);
+                        httpExchange.getResponseBody().write(message);
+                    }
                 }
+            } catch (Throwable t) {
+                System.out.println(String.format("[%d] handling %s failed with exception", id, outcome.getDisplayName()));
+                requestFailed(outcome, t);
+            } finally {
+                requestCompleted(outcome);
             }
         } finally {
             httpExchange.close();
+        }
+    }
+
+    private RequestOutcome requestStarted(HttpExchange httpExchange) {
+        lock.lock();
+        RequestOutcome outcome;
+        try {
+            outcome = new RequestOutcome(httpExchange.getRequestMethod(), httpExchange.getRequestURI().getPath());
+            outcomes.add(outcome);
+        } finally {
+            lock.unlock();
+        }
+        return outcome;
+    }
+
+    private void requestFailed(RequestOutcome outcome, Throwable t) {
+        lock.lock();
+        try {
+            if (outcome.failure == null) {
+                outcome.failure = new AssertionError(String.format("Failed to handle %s", outcome.getDisplayName()), t);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void requestCompleted(RequestOutcome outcome) {
+        lock.lock();
+        try {
+            outcome.completed = true;
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -168,7 +196,28 @@ class ChainingHttpHandler implements HttpHandler {
     }
 
     private static class RequestOutcome {
+        final String method;
+        final String url;
         Throwable failure;
+        boolean completed;
+
+        public RequestOutcome(String method, String url) {
+            this.method = method;
+            this.url = url;
+        }
+
+        String getDisplayName() {
+            return method + " " + url;
+        }
+
+        public void collectFailures(List<Throwable> failures) {
+            if (failure != null) {
+                failures.add(failure);
+            }
+            if (!completed) {
+                failures.add(new AssertionError(String.format("Request %s has not yet completed.", getDisplayName())));
+            }
+        }
     }
 
     interface HandlerFactory<T extends TrackingHttpHandler> {
